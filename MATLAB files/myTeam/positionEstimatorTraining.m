@@ -1,33 +1,26 @@
 function modelParameters = positionEstimatorTraining(training_data)
-% Train a Kalman Filter decoder for hand position (v2).
+% Train a Kalman Filter decoder with PCA observation subspace (v4).
 %
-%   State:       z = [x; y; vx; vy]       (4x1)
-%   Observation: r = smoothed firing rates (98x1, Hz)
+%   State:       z = [x; y; vx; vy]                     (4x1)
+%   Observation: obs = PC' * (smooth_rates - mean_fr)    (10x1)
 %
-%   Models:  z_t = A*z_{t-1} + w,   w ~ N(0, W)
-%            r_t = C*z_t     + q,   q ~ N(0, Q)
-%
-%   Improvements over v1:
-%     - 100ms causal spike window (not 20ms bin)
-%     - alpha=0.5 exponential smoothing
-%     - Low-firing neuron pruning (< 1 Hz)
-%     - Velocity damping A(3,3)=A(4,4)=0.85
-%     - Mean trajectory prior per angle (30 resampled bins)
-%     - Mean velocity at t=320 for initialisation
-%     - Cosine similarity angle classification
+%   Models:  z_t   = A * z_{t-1} + w,   w ~ N(0, W)     4x4
+%            obs_t = C * z_t     + q,   q ~ N(0, Q)    10x4
 
     n_neurons    = 98;
     n_angles     = 8;
     n_trials     = size(training_data, 1);
-    bin_width    = 20;     % ms per time step
-    alpha        = 0.5;    % exponential smoothing weight for new data
-    spike_window = 100;    % ms causal window for firing rate
-    vel_damp     = 0.85;   % velocity decay per step
-    n_traj_bins  = 30;     % bins for mean trajectory resampling
+    bin_width    = 20;
+    alpha        = 0.5;
+    spike_window = 100;
+    vel_damp     = 0.85;
+    n_traj_bins  = 50;     % template resolution (was 30)
+    n_pca        = 10;     % PCA components to keep
+    lambda       = 1e-6;   % Tikhonov regularisation
 
-    fprintf('Training Kalman Filter decoder (v2)...\n');
+    fprintf('Training Kalman Filter decoder (v4 — PCA + templates)...\n');
 
-    %% ---- 1. Extract states and observations from every trial ----
+    %% ==== 1. Extract states and smoothed rates from every trial ====
     max_per_angle = n_trials * 50;
 
     Za  = cell(1, n_angles);   Ra  = cell(1, n_angles);
@@ -44,21 +37,21 @@ function modelParameters = positionEstimatorTraining(training_data)
 
     for k = 1:n_angles
         for tr = 1:n_trials
-            spk = training_data(tr, k).spikes;          % 98 x T
-            pos = training_data(tr, k).handPos(1:2, :);  % 2 x T
+            spk = training_data(tr, k).spikes;
+            pos = training_data(tr, k).handPos(1:2, :);
             T   = size(spk, 2);
             n_bins = floor(T / bin_width);
             if n_bins < 3, continue; end
 
-            % -- Firing rate: 100ms causal window + exponential smoothing --
+            % Firing rate: 100ms causal window + exponential smoothing
             rates = zeros(n_neurons, n_bins);
             bin_centers = zeros(1, n_bins);
             for b = 1:n_bins
-                be = b * bin_width;                           % bin end (ms)
-                ws = max(1, be - spike_window + 1);           % window start
-                window_s = (be - ws + 1) / 1000;             % window duration (s)
+                be = b * bin_width;
+                ws = max(1, be - spike_window + 1);
+                window_s = (be - ws + 1) / 1000;
                 bin_centers(b) = round(((b-1)*bin_width + 1 + be) / 2);
-                raw_rate = sum(spk(:, ws:be), 2) / window_s; % Hz
+                raw_rate = sum(spk(:, ws:be), 2) / window_s;
                 if b == 1
                     rates(:, b) = raw_rate;
                 else
@@ -66,14 +59,14 @@ function modelParameters = positionEstimatorTraining(training_data)
                 end
             end
 
-            % -- Position at each bin center --
+            % Position at bin centers
             pos_bins = zeros(2, n_bins);
             for b = 1:n_bins
                 tc = min(bin_centers(b), size(pos, 2));
                 pos_bins(:, b) = pos(:, tc);
             end
 
-            % -- Velocity via central difference (mm/bin) --
+            % Velocity via central difference (mm/bin)
             vel_bins = zeros(2, n_bins);
             vel_bins(:, 1) = pos_bins(:, 2) - pos_bins(:, 1);
             for b = 2:n_bins - 1
@@ -81,12 +74,11 @@ function modelParameters = positionEstimatorTraining(training_data)
             end
             vel_bins(:, n_bins) = pos_bins(:, n_bins) - pos_bins(:, n_bins-1);
 
-            states = [pos_bins; vel_bins];   % 4 x n_bins
+            states = [pos_bins; vel_bins];
 
-            % -- Store per-angle --
             idx = cnt(k) + (1:n_bins);
-            Za{k}(:, idx) = states;
-            Ra{k}(:, idx) = rates;
+            Za{k}(:, idx)  = states;
+            Ra{k}(:, idx)  = rates;
             cnt(k) = cnt(k) + n_bins;
 
             n_pairs = n_bins - 1;
@@ -95,11 +87,10 @@ function modelParameters = positionEstimatorTraining(training_data)
             Zpa{k}(:, idx_t) = states(:, 1:end-1);
             cnt_t(k) = cnt_t(k) + n_pairs;
         end
-        fprintf('  Angle %d/%d: %d samples, %d transitions\n', ...
-            k, n_angles, cnt(k), cnt_t(k));
+        fprintf('  Angle %d/%d: %d samples\n', k, n_angles, cnt(k));
     end
 
-    % Trim to actual size
+    % Trim
     for k = 1:n_angles
         Za{k}  = Za{k}(:, 1:cnt(k));
         Ra{k}  = Ra{k}(:, 1:cnt(k));
@@ -107,45 +98,49 @@ function modelParameters = positionEstimatorTraining(training_data)
         Zpa{k} = Zpa{k}(:, 1:cnt_t(k));
     end
 
-    % Combine across all angles
-    Z_all  = [Za{:}];      % 4  x N_total
-    R_all  = [Ra{:}];      % 98 x N_total
-    Z_curr = [Zca{:}];     % 4  x M_total
-    Z_prev = [Zpa{:}];     % 4  x M_total
-    fprintf('  Combined: %d samples, %d transitions\n', ...
-        size(Z_all, 2), size(Z_curr, 2));
+    Z_all  = [Za{:}];
+    R_all  = [Ra{:}];
+    Z_curr = [Zca{:}];
+    Z_prev = [Zpa{:}];
+    fprintf('  Combined: %d samples, %d transitions\n', size(Z_all,2), size(Z_curr,2));
 
-    %% ---- 2. Identify low-firing neurons ----
-    mean_fr_all = mean(R_all, 2);             % 98 x 1
-    low_fr = mean_fr_all < 1;                 % logical mask
-    fprintf('  Pruning %d neurons with mean rate < 1 Hz\n', sum(low_fr));
+    %% ==== 2. PCA on firing rates (svd, no toolbox) ====
+    mean_fr    = mean(R_all, 2);            % 98x1  centering vector
+    R_centered = R_all - mean_fr;           % 98 x N
+    [U, ~, ~]  = svd(R_centered, 'econ');   % U: 98x98 (econ)
+    PC         = U(:, 1:n_pca);             % 98 x 10
 
-    %% ---- 3. Fit combined observation model ----
-    lambda = 1e-6;
+    % Project all rates into 10-dim subspace
+    R_pca = PC' * R_centered;               % 10 x N
 
-    C = (R_all * Z_all') / (Z_all * Z_all' + lambda * eye(4));  % 98 x 4
-    C(low_fr, :) = 0;                                            % zero out noisy neurons
-    Q = cov((R_all - C * Z_all)');                                % 98 x 98 recomputed
-    Q = Q + 0.01 * mean(diag(Q)) * eye(n_neurons);
+    % Per-angle projections
+    Ra_pca = cell(1, n_angles);
+    for k = 1:n_angles
+        Ra_pca{k} = PC' * (Ra{k} - mean_fr);  % 10 x N_k
+    end
+    fprintf('  PCA: kept %d of %d components\n', n_pca, n_neurons);
 
-    %% ---- 4. Fit combined state transition with velocity damping ----
-    A = (Z_curr * Z_prev') / (Z_prev * Z_prev' + lambda * eye(4));  % 4 x 4
-    A(3, 3) = vel_damp;   % force velocity decay
+    %% ==== 3. Fit combined observation model in PCA space ====
+    C = (R_pca * Z_all') / (Z_all * Z_all' + lambda * eye(4));   % 10 x 4
+    Q = cov((R_pca - C * Z_all)');                                 % 10 x 10
+    Q = Q + 0.01 * mean(diag(Q)) * eye(n_pca);
+
+    %% ==== 4. Fit combined state transition ====
+    A = (Z_curr * Z_prev') / (Z_prev * Z_prev' + lambda * eye(4));
+    A(3, 3) = vel_damp;
     A(4, 4) = vel_damp;
-    W = cov((Z_curr - A * Z_prev)');   % recompute W with damped A
+    W = cov((Z_curr - A * Z_prev)');
     W = W + 0.001 * mean(diag(W)) * eye(4);
 
-    fprintf('  Combined model fitted (vel damp = %.2f)\n', vel_damp);
+    fprintf('  Combined model fitted (C: %dx%d, Q: %dx%d)\n', ...
+        size(C,1), size(C,2), size(Q,1), size(Q,2));
 
-    %% ---- 5. Fit per-angle models ----
+    %% ==== 5. Per-angle Kalman models in PCA space ====
     for k = 1:n_angles
-        % Observation model
-        Ck = (Ra{k} * Za{k}') / (Za{k} * Za{k}' + lambda * eye(4));
-        Ck(low_fr, :) = 0;
-        Qk = cov((Ra{k} - Ck * Za{k})');
-        Qk = Qk + 0.01 * mean(diag(Qk)) * eye(n_neurons);
+        Ck = (Ra_pca{k} * Za{k}') / (Za{k} * Za{k}' + lambda * eye(4));  % 10x4
+        Qk = cov((Ra_pca{k} - Ck * Za{k})');                               % 10x10
+        Qk = Qk + 0.01 * mean(diag(Qk)) * eye(n_pca);
 
-        % State transition with damping
         Ak = (Zca{k} * Zpa{k}') / (Zpa{k} * Zpa{k}' + lambda * eye(4));
         Ak(3, 3) = vel_damp;
         Ak(4, 4) = vel_damp;
@@ -153,93 +148,164 @@ function modelParameters = positionEstimatorTraining(training_data)
         Wk = Wk + 0.001 * mean(diag(Wk)) * eye(4);
 
         perAngle(k).A = Ak;
-        perAngle(k).C = Ck;
-        perAngle(k).Q = Qk;
+        perAngle(k).C = Ck;   % 10x4
+        perAngle(k).Q = Qk;   % 10x10
         perAngle(k).W = Wk;
     end
-    fprintf('  Per-angle models fitted\n');
+    fprintf('  Per-angle models fitted (10-dim obs)\n');
 
-    %% ---- 6. Mean trajectory per angle (resampled to 30 bins) ----
-    mean_traj = zeros(2, n_traj_bins, n_angles);
-    mean_T    = zeros(1, n_angles);
+    %% ==== 6. Angle classifier — nearest centroid on 320ms spike features ====
+    n_class_bins = floor(320 / bin_width);           % 16
+    feat_dim     = n_neurons * n_class_bins;          % 1568
+    n_total      = n_trials * n_angles;
+
+    all_feat   = zeros(n_total, feat_dim);
+    all_labels = zeros(n_total, 1);
+    idx = 0;
+
+    for k = 1:n_angles
+        for tr = 1:n_trials
+            spk = training_data(tr, k).spikes;
+            T   = size(spk, 2);
+            t_use = min(320, T);
+            n_bu  = floor(t_use / bin_width);
+
+            feat = zeros(n_neurons, n_class_bins);
+            for b = 1:n_bu
+                bs = (b-1)*bin_width + 1;
+                be = b*bin_width;
+                feat(:, b) = sum(spk(:, bs:be), 2);
+            end
+
+            idx = idx + 1;
+            all_feat(idx, :)  = feat(:)';
+            all_labels(idx)   = k;
+        end
+    end
+
+    % Manual z-score (no zscore() toolbox function)
+    feat_mean = mean(all_feat, 1);             % 1 x 1568
+    feat_std  = std(all_feat, 0, 1);           % 1 x 1568
+    feat_std(feat_std < 1e-10) = 1;            % prevent div-by-zero
+    all_feat_z = (all_feat - feat_mean) ./ feat_std;
+
+    % Per-angle centroids
+    centroids = zeros(n_angles, feat_dim);
+    for k = 1:n_angles
+        centroids(k, :) = mean(all_feat_z(all_labels == k, :), 1);
+    end
+
+    % Classification accuracy on training data
+    correct = 0;
+    for i = 1:n_total
+        dists = zeros(1, n_angles);
+        for k = 1:n_angles
+            d = all_feat_z(i, :) - centroids(k, :);
+            dists(k) = sqrt(sum(d .* d));
+        end
+        [~, pred] = min(dists);
+        if pred == all_labels(i)
+            correct = correct + 1;
+        end
+    end
+    fprintf('  Classifier accuracy on training data: %.1f%% (%d/%d)\n', ...
+        correct / n_total * 100, correct, n_total);
+
+    %% ==== 7. Mean trajectory templates (50 pts, decode window only) ====
+    meanTraj = zeros(2, n_traj_bins, n_angles);
+    mean_T   = zeros(1, n_angles);
 
     for k = 1:n_angles
         traj_sum = zeros(2, n_traj_bins);
         T_sum    = 0;
+        n_valid  = 0;
         for tr = 1:n_trials
             pos = training_data(tr, k).handPos(1:2, :);
             T   = size(pos, 2);
             T_sum = T_sum + T;
-            % Resample to n_traj_bins points via linear interpolation
-            orig_t = 1:T;
-            new_t  = linspace(1, T, n_traj_bins);
-            traj_sum(1, :) = traj_sum(1, :) + interp1(orig_t, pos(1, :), new_t);
-            traj_sum(2, :) = traj_sum(2, :) + interp1(orig_t, pos(2, :), new_t);
+            ds = min(320, T);
+            if T - ds < bin_width, continue; end
+            % Resample from t=320 to t=end into n_traj_bins points
+            orig_t = ds:T;
+            new_t  = linspace(ds, T, n_traj_bins);
+            traj_sum(1, :) = traj_sum(1, :) + interp1(orig_t, pos(1, ds:T), new_t);
+            traj_sum(2, :) = traj_sum(2, :) + interp1(orig_t, pos(2, ds:T), new_t);
+            n_valid = n_valid + 1;
         end
-        mean_traj(:, :, k) = traj_sum / n_trials;
+        if n_valid > 0
+            meanTraj(:, :, k) = traj_sum / n_valid;
+        end
         mean_T(k) = T_sum / n_trials;
     end
-    fprintf('  Mean trajectories computed (%d bins, mean T: %.0f-%.0f ms)\n', ...
+    fprintf('  Mean trajectories: %d pts (decode window), mean T: %.0f-%.0f ms\n', ...
         n_traj_bins, min(mean_T), max(mean_T));
 
-    %% ---- 7. Mean velocity at t=320ms per angle (for initialisation) ----
+    %% ==== 8. Mean velocity at t=320ms per angle ====
     mean_vel_init = zeros(2, n_angles);
     for k = 1:n_angles
         vel_sum = zeros(2, 1);
-        n_valid = 0;
+        nv = 0;
         for tr = 1:n_trials
             pos = training_data(tr, k).handPos(1:2, :);
             T   = size(pos, 2);
             if T < 340, continue; end
-            % Central difference at t=320 over 40ms span -> mm/bin
             vel_sum = vel_sum + (pos(:, 340) - pos(:, 300)) / 2;
-            n_valid = n_valid + 1;
+            nv = nv + 1;
         end
-        if n_valid > 0
-            mean_vel_init(:, k) = vel_sum / n_valid;
+        if nv > 0
+            mean_vel_init(:, k) = vel_sum / nv;
         end
     end
-    fprintf('  Mean initial velocities computed\n');
 
-    %% ---- 8. Initial state covariance ----
+    %% ==== 9. Initial state covariance ====
     P0 = cov(Z_all') * 0.1;
 
-    %% ---- 9. Mean firing rate per angle (for cosine similarity) ----
-    mean_rates = zeros(n_neurons, n_angles);
-    for k = 1:n_angles
-        mean_rates(:, k) = mean(Ra{k}, 2);
-    end
+    %% ==== Store model parameters ====
+    % Kalman model (combined)
+    modelParameters.A  = A;           % 4x4
+    modelParameters.C  = C;           % 10x4
+    modelParameters.Q  = Q;           % 10x10
+    modelParameters.W  = W;           % 4x4
+    modelParameters.P0 = P0;          % 4x4
+    modelParameters.perAngle = perAngle;
 
-    %% ---- Store model parameters ----
-    modelParameters.A  = A;
-    modelParameters.C  = C;
-    modelParameters.Q  = Q;
-    modelParameters.W  = W;
-    modelParameters.P0 = P0;
-    modelParameters.perAngle      = perAngle;       % 1x8 struct
-    modelParameters.mean_rates    = mean_rates;      % 98 x 8
-    modelParameters.mean_traj     = mean_traj;       % 2 x 30 x 8
-    modelParameters.mean_T        = mean_T;          % 1 x 8
-    modelParameters.meanTrialLength = mean_T;        % 1 x 8 (alias for clarity)
-    modelParameters.mean_vel_init = mean_vel_init;   % 2 x 8
-    modelParameters.n_traj_bins   = n_traj_bins;
-    modelParameters.bin_width     = bin_width;
-    modelParameters.alpha         = alpha;
-    modelParameters.spike_window  = spike_window;
+    % PCA projection
+    modelParameters.PC      = PC;       % 98x10
+    modelParameters.mean_fr = mean_fr;  % 98x1
+    modelParameters.n_pca   = n_pca;
 
-    % Kalman runtime state (set on first prediction call per trial)
+    % Angle classifier
+    modelParameters.centroids    = centroids;     % 8x1568
+    modelParameters.feat_mean    = feat_mean;     % 1x1568
+    modelParameters.feat_std     = feat_std;      % 1x1568
+    modelParameters.n_class_bins = n_class_bins;  % 16
+
+    % Trajectory templates
+    modelParameters.meanTraj     = meanTraj;      % 2x50x8
+    modelParameters.mean_T       = mean_T;        % 1x8
+    modelParameters.meanTrialLength = mean_T;
+    modelParameters.mean_vel_init = mean_vel_init; % 2x8
+    modelParameters.n_traj_bins  = n_traj_bins;
+
+    % Spike processing constants
+    modelParameters.bin_width    = bin_width;
+    modelParameters.alpha        = alpha;
+    modelParameters.spike_window = spike_window;
+
+    % Runtime state (initialised per trial in positionEstimator)
     modelParameters.kalman_z      = [];
     modelParameters.kalman_P      = [];
     modelParameters.smooth_rates  = [];
     modelParameters.current_angle = 0;
+    modelParameters.classify_confidence = 0;
     modelParameters.active_A = A;
     modelParameters.active_C = C;
     modelParameters.active_Q = Q;
     modelParameters.active_W = W;
-    modelParameters.debug_count   = 0;   % for printing first 5 classifications
-    modelParameters.step_count    = 0;   % Kalman steps within current trial
-    modelParameters.low_vel_count = 0;   % consecutive low-velocity steps
-    modelParameters.vel_locked    = false; % velocity lock flag
+    modelParameters.debug_count   = 0;
+    modelParameters.step_count    = 0;
+    modelParameters.low_vel_count = 0;
+    modelParameters.vel_locked    = false;
 
     fprintf('Training complete.\n');
 end
