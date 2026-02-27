@@ -220,6 +220,7 @@ function modelParameters = positionEstimatorTraining(training_data)
     modelParameters.mean_rates    = mean_rates;      % 98 x 8
     modelParameters.mean_traj     = mean_traj;       % 2 x 30 x 8
     modelParameters.mean_T        = mean_T;          % 1 x 8
+    modelParameters.meanTrialLength = mean_T;        % 1 x 8 (alias for clarity)
     modelParameters.mean_vel_init = mean_vel_init;   % 2 x 8
     modelParameters.n_traj_bins   = n_traj_bins;
     modelParameters.bin_width     = bin_width;
@@ -235,7 +236,10 @@ function modelParameters = positionEstimatorTraining(training_data)
     modelParameters.active_C = C;
     modelParameters.active_Q = Q;
     modelParameters.active_W = W;
-    modelParameters.debug_count = 0;   % for printing first 5 classifications
+    modelParameters.debug_count   = 0;   % for printing first 5 classifications
+    modelParameters.step_count    = 0;   % Kalman steps within current trial
+    modelParameters.low_vel_count = 0;   % consecutive low-velocity steps
+    modelParameters.vel_locked    = false; % velocity lock flag
 
     fprintf('Training complete.\n');
 end
