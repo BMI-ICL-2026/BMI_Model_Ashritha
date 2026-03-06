@@ -1,18 +1,19 @@
-# BMI Neural Decoder — Kalman Filter with PCA Subspace
+# BMI Neural Decoder — kNN + LDA + Soft Templates
 
-A neural decoder for the Brain-Machine Interface (BMI) competition that predicts hand position from monkey motor cortex spike trains. Achieves **~18.30 mm RMSE** on the competition test harness.
+A neural decoder for the Brain-Machine Interface (BMI) competition that predicts hand position from monkey motor cortex spike trains. Achieves **~9.93 mm RMSE** on the competition test harness.
 
 ## Results
 
 | Metric | Value |
 |--------|-------|
-| **Final RMSE** | **~18.30 mm** (seed 2013) |
+| **Final RMSE** | **~9.93 mm** (seed 2015) |
 | Neurons | 98 |
 | Reaching angles | 8 |
 | Training trials | 50 per angle |
 | Test trials | ~50 per angle |
 | Decoding starts at | t = 320 ms |
 | Decode step size | 20 ms |
+| Runtime | ~30 seconds |
 
 ### RMSE Progression
 
@@ -22,53 +23,48 @@ A neural decoder for the Brain-Machine Interface (BMI) competition that predicts
 | v1 | Kalman Filter (98-dim observations) | 46.18 |
 | v2 | + Per-angle models, velocity damping, 100 ms spike window | 29.61 |
 | v3 | + Endpoint velocity suppression, trajectory blending | 29.23 |
-| **v4** | **+ PCA subspace (10-dim), nearest centroid classifier, confidence blending** | **~18.30** |
+| v4 | + PCA subspace (10-dim), nearest centroid classifier, confidence blending | ~18.30 |
+| v5 | Kalman + LDA + template blending (various Kalman architectures) | ~11.30 |
+| **v6** | **kNN position estimator + LDA classifier + soft templates** | **~9.93** |
 
 ## Architecture
+
+### Flowchart
 
 ```
                         TRAINING PIPELINE
                         =================
 
-  training_data(n,k).spikes  ──────────────────────────────┐
-       (98 x T binary)                                     │
-              │                                             │
-              v                                             v
-  ┌───────────────────────┐                    ┌────────────────────────┐
-  │  Spike Binning (20ms) │                    │  320ms Spike Features  │
-  │  + 100ms Causal Window│                    │  (98 x 16 bins = 1568) │
-  │  + Exp Smoothing a=0.5│                    │  per trial             │
-  └───────────┬───────────┘                    └────────────┬───────────┘
-              │                                             │
-              v                                             v
-  ┌───────────────────────┐                    ┌────────────────────────┐
-  │  Smoothed Rates       │                    │  Z-score + Nearest     │
-  │  (98 x N_bins)        │                    │  Centroid Classifier   │
-  └───────────┬───────────┘                    │  (8 angle centroids)   │
-              │                                └────────────────────────┘
-              v
-  ┌───────────────────────┐
-  │  PCA via SVD          │
-  │  98-dim  ──>  10-dim  │
-  │  PC = U(:, 1:10)      │
-  └───────────┬───────────┘
-              │
-              v
-  ┌───────────────────────────────────────────────────────┐
-  │              Per-Angle Kalman Model Fitting            │
-  │                                                       │
-  │  For each angle k = 1..8:                             │
-  │    State transition:  A_k (4x4), W_k (4x4)           │
-  │    Observation model: C_k (10x4), Q_k (10x10)        │
-  │    Velocity damping:  A_k(3,3) = A_k(4,4) = 0.85     │
-  └───────────────────────────────────────────────────────┘
-              │
-              v
-  ┌───────────────────────────────────────────────────────┐
-  │           Mean Trajectory Templates (50 pts)          │
-  │  Per-angle, covering decode window (t=320 to end)     │
-  │  + Mean velocity at t=320ms per angle                 │
-  └───────────────────────────────────────────────────────┘
+  training_data(n,k).spikes                training_data(n,k).spikes
+       (98 x T binary)                         (98 x T binary)
+              |                                       |
+              v                                       v
+  +-------------------------+           +---------------------------+
+  |  EMA Feature Extraction |           |  Spike Count Extraction   |
+  |  4 windows (80ms each)  |           |  80ms causal window       |
+  |  alpha = 0.92           |           |  at each 20ms decode step |
+  |  over first 320ms       |           |  from t=320 to trial end  |
+  +------------+------------+           +-------------+-------------+
+               |                                      |
+               v                                      v
+  +-------------------------+           +---------------------------+
+  |  Neuron Selection       |           |  PCA via SVD              |
+  |  Top 55 by directional  |           |  98-dim --> 25-dim        |
+  |  modulation score       |           |  PC = U(:, 1:25)          |
+  +------------+------------+           +-------------+-------------+
+               |                                      |
+               v                                      v
+  +-------------------------+           +---------------------------+
+  |  Z-score + LDA          |           |  kNN Database             |
+  |  55 neurons x 4 windows |           |  Per angle: store all     |
+  |  = 220 features         |           |  (PCA_feature, position)  |
+  |  Shrinkage covariance   |           |  pairs from training      |
+  |  --> 8 class means      |           |  ~1250 points per angle   |
+  |  --> Sw_inv for scoring  |           +---------------------------+
+  +-------------------------+
+               |
+               +-----> Also: Mean trajectory templates (50 pts per angle)
+                       Resampled from t=320 to trial end
 
 
 
@@ -76,85 +72,57 @@ A neural decoder for the Brain-Machine Interface (BMI) competition that predicts
                        =================
 
   test_data.spikes(:, 1:t)
-              │
-              v
-  ┌───────────────────────┐     t = 320 (first call)
-  │  Smoothed Firing Rate │─────────────────────────────┐
-  │  (100ms window, a=0.5)│                             │
-  └───────────┬───────────┘                             v
-              │                            ┌────────────────────────┐
-              │                            │  Angle Classification  │
-              │                            │  Nearest centroid on   │
-              │                            │  z-scored 320ms feats  │
-              │                            │  ──> angle k, conf c   │
-              │                            └────────────┬───────────┘
-              │                                         │
-              │                            Load per-angle model:
-              │                            A_k, C_k, Q_k, W_k
-              │                                         │
-              v                                         v
-  ┌───────────────────────┐          ┌──────────────────────────┐
-  │  PCA Projection       │          │  Init Kalman State       │
-  │  obs = PC'*(sr-mu)    │          │  z = [startPos; vel_320] │
-  │  (98-dim ──> 10-dim)  │          │  P = P0                  │
-  └───────────┬───────────┘          └──────────────────────────┘
-              │
-              v
-  ┌───────────────────────────────────────────────────────┐
-  │                  KALMAN FILTER STEP                    │
-  │                                                       │
-  │  PREDICT:                                             │
-  │    z_pred = A_k * z                                   │
-  │    P_pred = A_k * P * A_k' + W_eff                    │
-  │                                                       │
-  │  UPDATE (10-dim PCA space):                           │
-  │    innovation = obs_pca - C_k * z_pred     (10x1)     │
-  │    S = C_k * P_pred * C_k' + Q_eff        (10x10)    │
-  │    K = P_pred * C_k' / S                   (4x10)     │
-  │    z = z_pred + K * innovation             (4x1)      │
-  │    P = (I - K * C_k) * P_pred              (4x4)      │
-  └───────────┬───────────────────────────────────────────┘
-              │
-              v
-  ┌───────────────────────────────────────────────────────┐
-  │              TEMPORAL MODIFICATIONS                    │
-  │                                                       │
-  │  Early trial (step <= 5):  Q_eff = Q * 1.5            │
-  │  Late trial (progress > 0.7):                         │
-  │    - W_eff = W * 0.3                                  │
-  │    - P velocity rows/cols *= 0.5                      │
-  │  Velocity lock: if ||vel|| < 0.5 for 3 steps ──> 0   │
-  └───────────┬───────────────────────────────────────────┘
-              │
-              v
-  ┌───────────────────────────────────────────────────────┐
-  │         CONFIDENCE-BASED TEMPLATE BLENDING            │
-  │                                                       │
-  │  progress = (t - 320) / (mean_T - 320)               │
-  │  template_pos = meanTraj(:, bin, k)                   │
-  │                                                       │
-  │  conf > 0.6:  pos = 0.4*kalman + 0.6*template        │
-  │  conf 0.3-0.6: pos = 0.6*kalman + 0.4*template       │
-  │  conf < 0.3:  pos = 0.8*kalman + 0.2*template        │
-  └───────────┬───────────────────────────────────────────┘
-              │
-              v
-         [x, y] output
+              |
+              +------------------+------------------+
+              |                  |                  |
+              v                  v                  v
+  (first call only)     +---------------+   +---------------+
+  +----------------+    | Spike Count   |   | Spike Count   |
+  | EMA Features   |    | [t-80, t]     |   | [t-80, t]     |
+  | (first 320ms)  |    | 98-dim        |   | 98-dim        |
+  +-------+--------+    +-------+-------+   +-------+-------+
+          |                     |                   |
+          v                     v                   v
+  +----------------+    +---------------+   +---------------+
+  | LDA Classifier |    | PCA Project   |   | Soft Template |
+  | Mahalanobis    |    | 98 --> 25-dim |   | Softmax wts   |
+  | distance in    |    +-------+-------+   | x 8 angles    |
+  | 220-dim space  |            |           | + offset      |
+  | --> best angle |            v           | correction    |
+  | --> softmax    |    +---------------+   +-------+-------+
+  |    weights     |    | kNN Lookup    |           |
+  +-------+--------+    | 15 nearest    |           |
+          |             | neighbors     |           |
+          |             | inv-distance  |           |
+          |             | weighted avg  |           |
+          |             +-------+-------+           |
+          |                     |                   |
+          v                     v                   v
+  +-----------------------------------------------------+
+  |              BLEND: 55% kNN + 45% Soft Template      |
+  |                                                       |
+  |  kNN provides trial-adaptive position estimate        |
+  |  Template provides smooth baseline + robustness       |
+  |  to classification errors via softmax weighting       |
+  +---------------------------+---------------------------+
+                              |
+                              v
+                         [x, y] output
 ```
 
 ## Key Design Decisions
 
-- **PCA Dimensionality Reduction**: SVD on centred firing rates reduces 98 neurons to 10 principal components. This shrinks the Kalman observation space from 98x98 covariance inversions to 10x10, improving both speed and numerical stability.
+- **kNN Position Estimator**: Instead of a Kalman filter, we find training trials with the most similar neural activity (in PCA space) and use their hand positions. This is non-parametric — no state-space model assumptions, no temporal drift, and naturally handles speed/shape variation across trials. 15 nearest neighbors with inverse-distance weighting.
 
-- **Per-Angle Kalman Models**: Separate A, C, Q, W matrices for each of the 8 reaching angles capture direction-specific neural tuning and kinematics.
+- **LDA Classifier with Shrinkage**: At t=320ms, EMA-smoothed firing rates across 4 time windows (80ms each) form a 220-dim feature vector (55 selected neurons x 4 windows). Classified via Mahalanobis distance with shrinkage within-class covariance (30% toward diagonal).
 
-- **Nearest Centroid Classifier**: At t=320ms, spike counts across 16 bins (20ms each) form a 1568-dim feature vector. Z-scored and compared against 8 trained centroids via Euclidean distance. Confidence score derived from gap between best and second-best match.
+- **Neuron Selection**: Top 55 of 98 neurons ranked by directional modulation (variance of mean rate across angles). Low-rate neurons (< 0.5 Hz mean) suppressed. Reduces overfitting in the classifier.
 
-- **Template Blending**: Mean trajectory templates (50 timepoints per angle) act as a prior. Blending weight scales with classification confidence — high confidence trusts the template more.
+- **Soft Template Blending**: Instead of committing to a single classified angle, softmax weights distribute probability across all 8 angles. The template position is a weighted average, so misclassification causes a blended (not catastrophically wrong) estimate.
 
-- **Velocity Damping**: A(3,3) = A(4,4) = 0.85 applies natural deceleration, preventing velocity runaway.
+- **Template Offset Correction**: Each test trial's start position is compared to each angle's template start, and the offset is added throughout. Aligns templates to the actual trial geometry.
 
-- **Late-Trial Suppression**: After 70% of expected trial length, process noise W is shrunk (x0.3) and velocity covariance in P is squeezed (x0.5), allowing the filter to smoothly decelerate to the endpoint.
+- **PCA Dimensionality Reduction**: SVD on centred spike counts reduces 98 neurons to 25 principal components for the kNN feature space. Reduces noise and speeds up distance computation.
 
 ## Toolboxes Used
 
@@ -163,14 +131,13 @@ A neural decoder for the Brain-Machine Interface (BMI) competition that predicts
 | Function | Purpose |
 |----------|---------|
 | `svd(X, 'econ')` | PCA via singular value decomposition |
-| `cov()` | Covariance matrix estimation |
-| `mean()`, `std()` | Feature statistics |
+| `pinv()` | Pseudoinverse for LDA covariance |
+| `mean()`, `std()`, `var()` | Feature statistics |
 | `interp1()` | Trajectory template resampling |
-| `eye()`, `zeros()`, `ones()` | Matrix construction |
-| `norm()`, `dot()` | Vector operations |
-| `sum()`, `sqrt()`, `sort()` | Basic math |
-| `linspace()`, `round()`, `floor()` | Index computation |
-| `fprintf()` | Debug output |
+| `sort()` | kNN neighbor selection |
+| `exp()`, `log()` | Softmax computation |
+| `sum()`, `zeros()`, `eye()` | Matrix/vector operations |
+| `linspace()`, `round()`, `min()`, `max()` | Index computation |
 
 No Signal Processing Toolbox, Statistics Toolbox, or any other toolbox is required.
 
@@ -184,10 +151,10 @@ BMI/
 │   ├── testFunction_for_students_MTb.m    # Competition test harness
 │   ├── monkeydata_training.mat            # Raw training data
 │   └── myTeam/
-│       ├── positionEstimatorTraining.m    # Training function (v4)
-│       └── positionEstimator.m            # Decoding function (v4)
-└── tasks/
-    └── lessons.md
+│       ├── positionEstimatorTraining.m    # Training function (v6)
+│       └── positionEstimator.m            # Decoding function (v6)
+└── Intitial docs/
+    └── CompetitionDocument(1) (1).pdf     # Competition rules
 ```
 
 ## How to Run
@@ -200,26 +167,18 @@ BMI/
    ```
    This trains the model and evaluates RMSE on the test split automatically.
 
-## State Vector
-
-```
-z = [x; y; vx; vy]    (4 x 1)
-
-x, y   — hand position (mm)
-vx, vy — hand velocity (mm/bin)
-```
-
 ## Hyperparameters
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `bin_width` | 20 ms | Spike binning resolution |
-| `spike_window` | 100 ms | Causal firing rate window |
-| `alpha` | 0.5 | Exponential smoothing factor |
-| `vel_damp` | 0.85 | Velocity damping in state transition |
-| `n_pca` | 10 | PCA components retained |
+| `bin_width` | 20 ms | Decode step size |
+| `obs_window` | 80 ms | Spike count window for kNN features |
+| `n_pca` | 25 | PCA components for kNN feature space |
+| `k_neighbors` | 15 | Number of nearest neighbors |
+| `knn_weight` | 0.55 | kNN blend weight (vs 0.45 template) |
+| `ema_alpha` | 0.92 | EMA smoothing for classifier features |
+| `n_keep` | 55 | Neurons selected for classifier |
+| `shrinkage` | 0.30 | LDA covariance shrinkage toward diagonal |
 | `n_traj_bins` | 50 | Trajectory template resolution |
-| `lambda` | 1e-6 | Tikhonov regularisation |
-| `Q scale` | 1.5x | Observation noise inflation (first 5 steps) |
-| `W scale` | 0.3x | Process noise reduction (late trial) |
-| `vel_lock threshold` | 0.5 | Velocity norm for endpoint locking |
+| `class_T` | 320 ms | Spike data used for classification |
+| `win_edges` | [1-80, 81-160, 161-240, 241-320] | Classifier time windows |
